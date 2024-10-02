@@ -5,10 +5,12 @@ use grafton_visca::{
         pan_tilt::{PanSpeed, PanTiltDirection, TiltSpeed},
         PanTiltCommand, ZoomCommand,
     },
-    send_command_and_wait, TcpTransport,
+    UdpTransport, ViscaTransport,
 };
 use std::{net::ToSocketAddrs, thread, time::Duration};
 use watch::WatchReceiver;
+
+const MAX_ZOOM_LEVEL: u16 = 16500;
 
 /// Sends commands to a PTZ camera based on joystick input.
 pub struct CameraBridge {
@@ -16,6 +18,9 @@ pub struct CameraBridge {
     state_receiver: WatchReceiver<JoystickState>,
     min_update_interval: Duration,
     pan_tilt_threshold: f32,
+    pan_max_speed: u8,
+    tilt_max_speed: u8,
+    invert_z_axis: bool,
     pan_tilt_direction: PanTiltDirection,
     pan_speed: PanSpeed,
     tilt_speed: TiltSpeed,
@@ -25,6 +30,10 @@ pub struct CameraBridge {
 impl CameraBridge {
     pub fn new(
         visca_addr: impl ToSocketAddrs,
+        pan_tilt_threshold: f32,
+        pan_max_speed: u8,
+        tilt_max_speed: u8,
+        invert_z_axis: bool,
         state_receiver: WatchReceiver<JoystickState>,
     ) -> Result<Self> {
         let socket_addr = visca_addr
@@ -35,8 +44,11 @@ impl CameraBridge {
         Ok(Self {
             transport_addr: format!("{}:{}", socket_addr.ip(), socket_addr.port()),
             state_receiver,
-            min_update_interval: Duration::from_millis(100),
-            pan_tilt_threshold: 0.25,
+            min_update_interval: Duration::from_millis(50),
+            pan_tilt_threshold,
+            pan_max_speed: pan_max_speed.min(24),
+            tilt_max_speed: tilt_max_speed.min(20),
+            invert_z_axis,
             pan_tilt_direction: PanTiltDirection::Stop,
             pan_speed: PanSpeed::STOP,
             tilt_speed: TiltSpeed::STOP,
@@ -61,14 +73,11 @@ impl CameraBridge {
                         self.pan_tilt_direction, self.pan_speed, self.tilt_speed,
                     );
 
-                    if let Err(e) = send_command_and_wait(
-                        &mut transport,
-                        &PanTiltCommand {
-                            pan_speed: self.pan_speed,
-                            tilt_speed: self.tilt_speed,
-                            direction: self.pan_tilt_direction,
-                        },
-                    ) {
+                    if let Err(e) = transport.send_command(&PanTiltCommand {
+                        pan_speed: self.pan_speed,
+                        tilt_speed: self.tilt_speed,
+                        direction: self.pan_tilt_direction,
+                    }) {
                         eprintln!("Failed to send pan/tilt command: {}", e);
                         break;
                     }
@@ -77,13 +86,11 @@ impl CameraBridge {
                 if self.handle_zoom(&state) {
                     changes_detected = true;
 
-                    println!("{:?}", self.last_zoom_position);
+                    println!("Zoom to: {:?}", self.last_zoom_position);
 
                     if let Some(zoom_position) = self.last_zoom_position {
-                        if let Err(e) = send_command_and_wait(
-                            &mut transport,
-                            &ZoomCommand::Direct(zoom_position),
-                        ) {
+                        if let Err(e) = transport.send_command(&ZoomCommand::Direct(zoom_position))
+                        {
                             eprintln!("Failed to send zoom command: {}", e);
                             break;
                         }
@@ -99,9 +106,9 @@ impl CameraBridge {
         }
     }
 
-    fn connect_to_camera(&self) -> TcpTransport {
+    fn connect_to_camera(&self) -> UdpTransport {
         loop {
-            match TcpTransport::new(&self.transport_addr) {
+            match UdpTransport::new(&self.transport_addr) {
                 Ok(transport) => return transport,
                 Err(e) => {
                     eprintln!("Failed to connect to camera, retrying later: {}", e);
@@ -112,8 +119,10 @@ impl CameraBridge {
     }
 
     fn handle_pan_tilt(&mut self, state: &JoystickState) -> bool {
-        let x_speed = interpret_axis_speed(state.axis_x, 24, self.pan_tilt_threshold);
-        let y_speed = interpret_axis_speed(state.axis_y, 20, self.pan_tilt_threshold);
+        let x_speed =
+            interpret_axis_speed(state.axis_x, self.pan_max_speed, self.pan_tilt_threshold);
+        let y_speed =
+            interpret_axis_speed(state.axis_y, self.tilt_max_speed, self.pan_tilt_threshold);
         let pan_speed = PanSpeed::new(x_speed.unsigned_abs()).unwrap();
         let tilt_speed = TiltSpeed::new(y_speed.unsigned_abs()).unwrap();
 
@@ -151,7 +160,11 @@ impl CameraBridge {
     }
 
     fn handle_zoom(&mut self, state: &JoystickState) -> bool {
-        let zoom_level = interpret_zoom_level(state.axis_z);
+        let zoom_level = interpret_zoom_level(if self.invert_z_axis {
+            -state.axis_z
+        } else {
+            state.axis_z
+        });
 
         if Some(zoom_level) != self.last_zoom_position {
             self.last_zoom_position = Some(zoom_level);
@@ -182,7 +195,7 @@ fn interpret_axis_speed(axis_position: f32, axis_max: u8, move_threshold: f32) -
 
 fn interpret_zoom_level(axis_position: f32) -> u16 {
     if axis_position > 0.99 {
-        return 4000;
+        return MAX_ZOOM_LEVEL;
     }
 
     if axis_position < -0.99 {
@@ -190,5 +203,5 @@ fn interpret_zoom_level(axis_position: f32) -> u16 {
     }
 
     let percentage = axis_position / 2.0 + 0.5;
-    (4000.0 * percentage) as u16
+    (MAX_ZOOM_LEVEL as f32 * percentage) as u16
 }

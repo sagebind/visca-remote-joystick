@@ -49,10 +49,14 @@ impl ControllerMonitor {
                         EventType::AxisChanged(Axis::LeftStickY, value, ..) => {
                             self.sender.update(|f| f.axis_y = value);
                         }
-                        EventType::AxisChanged(Axis::LeftZ, value, ..) => {
+                        EventType::AxisChanged(
+                            Axis::LeftZ | Axis::RightZ | Axis::RightStickX | Axis::Unknown,
+                            value,
+                            ..,
+                        ) => {
                             self.sender.update(|f| f.axis_z = value);
                         }
-                        _ => (),
+                        _ => {}
                     }
                 }
             }
@@ -60,11 +64,17 @@ impl ControllerMonitor {
     }
 
     pub fn select_gamepad(&mut self) {
+        println!("Discovering game controllers...");
+        let mut selected = None;
+
         for (id, gamepad) in self.gilrs.gamepads() {
-            if gamepad.name().contains(&self.name_matches) {
-                self.selected_gamepad = Some(id);
-                return;
+            println!("  {}", gamepad.name());
+
+            if selected.is_none() && gamepad.name().contains(&self.name_matches) {
+                selected = Some(id);
             }
         }
+
+        self.selected_gamepad = selected;
     }
 }
